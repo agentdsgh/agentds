@@ -22,8 +22,8 @@ FREEDEEPSEEK_JUDGE_MODEL  = "deepseek-reasoner"       # модель-ревью�
 FREEDEEPSEEK_N_CTX        = 64000                     # реалистичный лимит DeepSeek Web через прокси
 
 # ======================= Троттлинг =======================
-MIN_INTERVAL_SEC = 6.0        # минимум между ЛЮБЫМИ запросами к прокси (chat и reasoner)
-MAX_RETRIES_429  = 2          # попыток при 429 (Retry-After обычно 60 с)
+MIN_INTERVAL_SEC = 8.0        # минимум между ЛЮБЫМИ запросами к прокси (chat и reasoner)
+MAX_RETRIES_429  = 3          # попыток при 429 (Retry-After обычно 60 с)
 MAX_RETRIES_5XX  = 3          # попыток при 5xx
 MIN_INTERVAL_JUDGE_SEC = 10.0 # отдельный интервал для судьи (deepseek-reasoner)
 _last_request_ts    = 0.0
@@ -1510,6 +1510,17 @@ def init_model():
 
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--issue", type=int, action="append", help="пересчитать только эти issues")
+    ap.add_argument("--rerun", action="store_true", help="пересчитать даже solved")
+    args = ap.parse_args()
+
+    if args.issue:
+        ONLY_ISSUES = args.issue          # noqa: F811 — перекрываем глобальную
+    if args.rerun:
+        RERUN_DONE = True                  # noqa: F811
+
     init_model()
     results = run_agent()
     print("\nГотово. Результаты в", OUT_DIR)
