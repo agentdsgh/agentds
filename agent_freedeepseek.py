@@ -12,7 +12,7 @@
   - usage в стриме не приходит — оцениваем prompt_tokens по длине messages.
   - Общий троттлинг MIN_INTERVAL_SEC между всеми запросами + ретраи 429/5xx.
 """
-import os, re, json, time, subprocess, shutil, pathlib, inspect, functools, signal, requests, base64, shlex, hashlib, random, threading
+import os, re, json, time, subprocess, shutil, pathlib, inspect, functools, signal, requests, base64, shlex, hashlib, random, threading, argparse
 
 # ======================= FreeDeepseekAPI =======================
 FREEDEEPSEEK_URL          = "http://localhost:9655/v1"
@@ -1540,17 +1540,144 @@ def init_model():
           f"N_CTX={FREEDEEPSEEK_N_CTX}, min_interval={MIN_INTERVAL_SEC:.1f}s")
 
 
-if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--issue", type=int, action="append", help="пересчитать только эти issues")
-    ap.add_argument("--rerun", action="store_true", help="пересчитать даже solved")
-    args = ap.parse_args()
+def _parse_issues_list(value):
+    """Разбирает '2,3,4' / '2 3 4' / '2;3' в список int. None/'' → None."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [int(v) for v in value]
+    nums = []
+    for part in re.split(r"[,\s;]+", str(value).strip()):
+        if not part:
+            continue
+        try:
+            nums.append(int(part.lstrip("#")))
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"не число в списке issues: {part!r}")
+    return nums or None
 
-    if args.issue:
-        ONLY_ISSUES = args.issue          # noqa: F811 — перекрываем глобальную
+
+def _env_bool(name, default=False):
+    """Читает булеву env-переменную (1/true/yes/on)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _env_int(name, default=None):
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
+def _apply_cli_args(args):
+    """Переопределяет глобальные константы из CLI/env ДО первого обращения к GitHub API.
+    Приоритет: CLI → env → значения по умолчанию (уже заданные в модуле)."""
+    global GITHUB_OWNER, GITHUB_REPO, BASE_BRANCH, REPO_CLONE_URL
+    global REPO_PATH, CODESPACE_WORKDIR
+    global ISSUE_STATE, ONLY_ISSUES, ISSUE_LIMIT, RERUN_DONE, MAX_TOTAL_SEC
+    global GITHUB_WRITE, GITHUB_PUSH, OPEN_PR, PR_DRAFT
+    global USE_CODESPACES, STEPS_PER_ROUND, MAX_ROUNDS
+
+    # --- репозиторий / базовая ветка ---
+    GITHUB_OWNER = args.owner or os.environ.get("GITHUB_OWNER") or GITHUB_OWNER
+    GITHUB_REPO = args.repo or os.environ.get("GITHUB_REPO") or GITHUB_REPO
+    BASE_BRANCH = args.base or os.environ.get("GITHUB_BASE_BRANCH") or BASE_BRANCH
+
+    # --- выбор issues ---
+    cli_issues = args.issues if getattr(args, "issues", None) is not None else getattr(args, "issue", None)
+    ISSUE_STATE = args.state or os.environ.get("ISSUE_STATE") or ISSUE_STATE
+    if cli_issues is not None:
+        ONLY_ISSUES = cli_issues
+    elif os.environ.get("ONLY_ISSUES"):
+        ONLY_ISSUES = _parse_issues_list(os.environ["ONLY_ISSUES"])
+    if args.limit is not None:
+        ISSUE_LIMIT = args.limit
+    else:
+        ISSUE_LIMIT = _env_int("ISSUE_LIMIT", ISSUE_LIMIT)
     if args.rerun:
-        RERUN_DONE = True                  # noqa: F811
+        RERUN_DONE = True
+
+    # --- таймаут прогона ---
+    if args.max_total_sec is not None:
+        MAX_TOTAL_SEC = args.max_total_sec
+    else:
+        MAX_TOTAL_SEC = _env_int("MAX_TOTAL_SEC", MAX_TOTAL_SEC)
+
+    # --- лимиты агента ---
+    if args.steps is not None:
+        STEPS_PER_ROUND = args.steps
+    else:
+        STEPS_PER_ROUND = _env_int("STEPS_PER_ROUND", STEPS_PER_ROUND)
+    if args.rounds is not None:
+        MAX_ROUNDS = args.rounds
+    else:
+        MAX_ROUNDS = _env_int("MAX_ROUNDS", MAX_ROUNDS)
+
+    # --- Codespaces ---
+    if args.no_codespaces:
+        USE_CODESPACES = False
+    elif _env_bool("NO_CODESPACES", False):
+        USE_CODESPACES = False
+
+    # --- dry-run: гарантированно отключает любую запись в GitHub ---
+    dry_run = bool(args.dry_run) or _env_bool("DRY_RUN", False)
+    if dry_run:
+        GITHUB_WRITE = False
+        GITHUB_PUSH = False
+        OPEN_PR = False
+        PR_DRAFT = False
+
+    # --- пересчёт производных путей (они вычислялись при импорте от старых значений) ---
+    REPO_PATH = f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+    CODESPACE_WORKDIR = f"/workspaces/{GITHUB_REPO}"
+
+    print(f"Репозиторий: {GITHUB_OWNER}/{GITHUB_REPO}"
+          f"{', базовая ветка=' + str(BASE_BRANCH) if BASE_BRANCH else ''}"
+          f"{', state=' + str(ISSUE_STATE)}"
+          f"{', dry_run' if dry_run else ''}")
+
+
+def _build_arg_parser():
+    ap = argparse.ArgumentParser(
+        description="Агент для GitHub-репозитория через FreeDeepseekAPI. "
+                    "Приоритет настроек: CLI → переменные окружения → значения по умолчанию.",
+        epilog="Пример: python agent_freedeepseek.py --owner myorg --repo myrepo --issues 2,3 --limit 2 --dry-run",
+    )
+    ap.add_argument("--owner", default=None,
+                    help="владелец репозитория (env GITHUB_OWNER, по умолчанию agentdsgh)")
+    ap.add_argument("--repo", default=None,
+                    help="имя репозитория (env GITHUB_REPO, по умолчанию agentds)")
+    ap.add_argument("--base", default=None,
+                    help="базовая ветка (env GITHUB_BASE_BRANCH, по умолчанию ветка репозитория)")
+    ap.add_argument("--issues", type=_parse_issues_list, default=None, metavar="N[,N...]",
+                    help="список номеров issue через запятую, напр. 2,3,4 (env ONLY_ISSUES)")
+    ap.add_argument("--issue", type=int, action="append", default=None,
+                    help="устаревший синоним --issues, можно указывать несколько раз")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="максимум issues за прогон (env ISSUE_LIMIT)")
+    ap.add_argument("--state", choices=("open", "closed", "all"), default=None,
+                    help="фильтр состояния issues (env ISSUE_STATE, по умолчанию open)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="не писать в GitHub: отключает GITHUB_WRITE, GITHUB_PUSH, OPEN_PR, PR_DRAFT (env DRY_RUN)")
+    ap.add_argument("--no-codespaces", action="store_true",
+                    help="не использовать GitHub Codespaces (env NO_CODESPACES)")
+    ap.add_argument("--steps", type=int, default=None,
+                    help="вызовов инструментов на раунд (env STEPS_PER_ROUND, по умолчанию 6)")
+    ap.add_argument("--rounds", type=int, default=None,
+                    help="раундов на issue (env MAX_ROUNDS, по умолчанию 3)")
+    ap.add_argument("--max-total-sec", type=int, default=None, dest="max_total_sec",
+                    help="глобальный таймаут прогона в секундах (env MAX_TOTAL_SEC)")
+    ap.add_argument("--rerun", action="store_true",
+                    help="пересчитать даже уже решённые issues")
+    return ap
+
+
+if __name__ == "__main__":
+    args = _build_arg_parser().parse_args()
+    _apply_cli_args(args)
 
     init_model()
     results = run_agent()
