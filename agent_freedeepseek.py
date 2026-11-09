@@ -22,8 +22,8 @@ FREEDEEPSEEK_JUDGE_MODEL  = "deepseek-reasoner"       # модель-ревью�
 FREEDEEPSEEK_N_CTX        = 64000                     # реалистичный лимит DeepSeek Web через прокси
 
 # ======================= Троттлинг =======================
-MIN_INTERVAL_SEC = 6.0        # минимум между ЛЮБЫМИ запросами к прокси (chat и reasoner)
-MAX_RETRIES_429  = 2          # попыток при 429 (Retry-After обычно 60 с)
+MIN_INTERVAL_SEC = 8.0        # минимум между ЛЮБЫМИ запросами к прокси (chat и reasoner)
+MAX_RETRIES_429  = 3          # попыток при 429 (Retry-After обычно 60 с)
 MAX_RETRIES_5XX  = 3          # попыток при 5xx
 MIN_INTERVAL_JUDGE_SEC = 10.0 # отдельный интервал для судьи (deepseek-reasoner)
 _last_request_ts    = 0.0
@@ -252,10 +252,10 @@ GH_PUSH = {"ok": True, "reason": None}
 def _push_failed(label, text):
     msg = f"{label}: {text}"
     if re.search(r"\b(401|403|404)\b|denied|not accessible|Write access|Permission", text, re.I):
-        GH_PUSH["ok"] = False
+        # Не отключаем push/PR навсегда: причина сохраняется для отчёта, но следующая
+        # попытка (следующий issue / повторный запуск) снова пробует отправить изменения.
         GH_PUSH["reason"] = (msg + " (похоже на нехватку прав токена: нужны Contents: Read and write и Pull requests: Read and write, "
-                             "репозиторий должен быть выбран в токене; если правился .github/workflows - ещё Workflows: Read and write). "
-                             "Дальше push и PR отключены.")
+                             "репозиторий должен быть выбран в токене; если правился .github/workflows - ещё Workflows: Read and write).")
     return msg
 
 def gh_open_pr(branch, base, title, body, draft):
@@ -1238,7 +1238,10 @@ def compose_pr_body(res):
     return "\n".join(L)
 
 def publish_branch(res, patch):
-    if not GITHUB_PUSH or res["status"] not in PUSH_STATUSES or not patch.strip():
+    # Публикуем всегда, когда есть реальные изменения в коде, даже если агент не
+    # подтвердил завершение (partial) или не успел (failed): иначе правки теряются
+    # локально и в GitHub ничего не появляется — это и была причина issue #2.
+    if not GITHUB_PUSH or not patch.strip():
         return {"state": "skipped"}
     branch, base = res["branch"], res["base"]
     if not branch.startswith(BRANCH_PREFIX + "/") or branch == base:
@@ -1261,7 +1264,9 @@ def publish_branch(res, patch):
     return out
 
 def publish_comment(res, patch):
-    if res["status"] not in COMMENT_STATUSES or not patch.strip():
+    # Отчёт публикуем при любом непустом статусе (включая failed/error), чтобы в issue
+    # была видна причина, почему изменения не появились в GitHub (см. issue #2).
+    if res["status"] not in COMMENT_STATUSES and not (GITHUB_WRITE and res["status"] in ("failed", "error")):
         return {"state": "skipped"}
     body = compose_comment(res, patch)
     _draft(f"report-issue-{res['number']}.md", body)
@@ -1505,6 +1510,17 @@ def init_model():
 
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--issue", type=int, action="append", help="пересчитать только эти issues")
+    ap.add_argument("--rerun", action="store_true", help="пересчитать даже solved")
+    args = ap.parse_args()
+
+    if args.issue:
+        ONLY_ISSUES = args.issue          # noqa: F811 — перекрываем глобальную
+    if args.rerun:
+        RERUN_DONE = True                  # noqa: F811
+
     init_model()
     results = run_agent()
     print("\nГотово. Результаты в", OUT_DIR)
