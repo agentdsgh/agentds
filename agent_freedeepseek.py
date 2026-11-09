@@ -23,17 +23,21 @@ FREEDEEPSEEK_N_CTX        = 64000                     # реалистичный
 
 # ======================= Троттлинг =======================
 MIN_INTERVAL_SEC = 6.0        # минимум между ЛЮБЫМИ запросами к прокси (chat и reasoner)
-MAX_RETRIES      = 3          # попыток при 429/5xx
+MAX_RETRIES_429  = 2          # попыток при 429 (Retry-After обычно 60 с)
+MAX_RETRIES_5XX  = 3          # попыток при 5xx
+MIN_INTERVAL_JUDGE_SEC = 10.0 # отдельный интервал для судьи (deepseek-reasoner)
 _last_request_ts    = 0.0
 _last_request_lock  = threading.Lock()
 
-def _throttle():
-    """Гарантирует паузу MIN_INTERVAL_SEC между запросами (единый счётчик для всех моделей)."""
+def _throttle(min_interval=None, label=""):
+    """Гарантирует паузу между запросами (единый счётчик для всех моделей) и ЛОГИРУЕТ её."""
     global _last_request_ts
+    min_interval = MIN_INTERVAL_SEC if min_interval is None else min_interval
     with _last_request_lock:
         now = time.time()
-        wait = MIN_INTERVAL_SEC - (now - _last_request_ts)
+        wait = min_interval - (now - _last_request_ts)
         if wait > 0:
+            print(f"[{_ts()}] throttle: пауза {wait:.1f}s перед {label or 'запросом'}", flush=True)
             time.sleep(wait)
         _last_request_ts = time.time()
 
@@ -63,9 +67,9 @@ RERUN_DONE   = False
 MAX_TOTAL_SEC = None
 
 # ======================= Лимиты агента =======================
-STEPS_PER_ROUND   = 10
-MAX_ROUNDS        = 4
-TEXT_EXTRA_TURNS  = 4
+STEPS_PER_ROUND   = 6          # было 10: меньше запросов подряд → меньше 429
+MAX_ROUNDS        = 3          # было 4
+TEXT_EXTRA_TURNS  = 2          # было 4
 TOOL_OUTPUT_LIMIT = 12000
 CMD_MAX_SEC       = 300
 CMD_TOTAL_SEC     = 900
@@ -276,6 +280,10 @@ def gh_open_pr(branch, base, title, body, draft):
 class ContextExceeded(Exception):
     pass
 
+class RateLimited(Exception):
+    """DeepSeek Web вернул 429 после всех попыток; раунд надо завершить, а не тратить ход."""
+    pass
+
 def _ts():
     return time.strftime("%H:%M:%S")
 
@@ -302,16 +310,19 @@ def llm_stream(messages, max_tokens=None, model=None, show=True):
         "top_p": 0.95,
     }
 
+    min_interval = MIN_INTERVAL_JUDGE_SEC if model == FREEDEEPSEEK_JUDGE_MODEL else MIN_INTERVAL_SEC
+    t_req_start = time.time()
     last_err = None
-    for attempt in range(MAX_RETRIES):
-        _throttle()
+    max_retries = MAX_RETRIES_429 if False else max(MAX_RETRIES_429, MAX_RETRIES_5XX)
+    for attempt in range(max_retries):
+        _throttle(min_interval=min_interval, label=model)
         try:
             r = requests.post(FREEDEEPSEEK_URL + "/chat/completions", json=payload,
                               headers=headers, stream=True, timeout=(30, 600))
             r.encoding = "utf-8"
         except requests.RequestException as e:
             last_err = f"{type(e).__name__}: {e}"
-            print(f"[{_ts()}] RequestException: {e} → пауза", flush=True)
+            print(f"[{_ts()}] RequestException: {e}", flush=True)
             time.sleep(_retry_after(None, attempt))
             continue
 
@@ -320,16 +331,24 @@ def llm_stream(messages, max_tokens=None, model=None, show=True):
         body = (r.text or "")[:600]
         if r.status_code == 400 and re.search(r"context|exceed|too long", body, re.I):
             raise ContextExceeded(body)
-        if r.status_code == 429 or 500 <= r.status_code < 600:
+        if r.status_code == 429:
+            last_err = f"HTTP 429: {body}"
+            wait = _retry_after(r, attempt)
+            print(f"[{_ts()}] 429 → пауза {wait:.1f}s (попытка 429 {attempt+1}/{MAX_RETRIES_429})", flush=True)
+            time.sleep(wait)
+            if attempt + 1 >= MAX_RETRIES_429:
+                raise RateLimited(f"429 после {MAX_RETRIES_429} попыток: {body}")
+            continue
+        if 500 <= r.status_code < 600:
             last_err = f"HTTP {r.status_code}: {body}"
             wait = _retry_after(r, attempt)
-            print(f"[{_ts()}] {r.status_code} → пауза {wait:.1f}s (попытка {attempt+1}/{MAX_RETRIES})", flush=True)
+            print(f"[{_ts()}] {r.status_code} → пауза {wait:.1f}s (попытка 5xx {attempt+1}/{MAX_RETRIES_5XX})", flush=True)
             time.sleep(wait)
             continue
         raise RuntimeError(f"HTTP {r.status_code}: {body}")
     else:
-        print(f"[{_ts()}] llm_stream: все {MAX_RETRIES} попыток провалились. {last_err}", flush=True)
-        return {"content": "", "finish": "rate_limit",
+        print(f"[{_ts()}] llm_stream: все попытки провалились. {last_err}", flush=True)
+        return {"content": "", "finish": "error",
                 "usage": {"prompt_tokens": _estimate_prompt_tokens(messages),
                           "completion_tokens": 0, "total_tokens": 0, "estimated": True}}
 
@@ -361,9 +380,10 @@ def llm_stream(messages, max_tokens=None, model=None, show=True):
     usage = {"prompt_tokens": est_prompt, "completion_tokens": content_chunks,
              "total_tokens": est_prompt + content_chunks, "estimated": True}
 
+    t_total = time.time() - t_req_start
     if show and STREAM_VIEW != "off":
         print(f" ← модель[{model}]: {content_chunks} чанков, ~{len(text)} симв, "
-              f"~{est_prompt} промпт-ток, {dt:.1f} с, finish={finish}", flush=True)
+              f"~{est_prompt} промпт-ток, стрим {dt:.1f} с, всего {t_total:.1f} с, finish={finish}", flush=True)
 
     return {"content": text, "finish": finish, "usage": usage}
 
@@ -1090,29 +1110,29 @@ def run_round(system, first_msg, tools, budget):
             out = llm_stream(messages, model=FREEDEEPSEEK_MODEL)
         except ContextExceeded:
             return last_text or "(контекст переполнен)", "context"
+        except RateLimited as e:
+            print(f"[{_ts()}] rate limit: раунд завершается без траты хода ({e})", flush=True)
+            return last_text or "(rate limit)", "rate_limit"
 
         text = clean_answer(out["content"])
 
-        # один автоматический ретрай на пустой ответ — без траты хода
-        if not text:
-            print(f"[{_ts()}] пустой ответ, ретрай...", flush=True)
-            try:
-                out2 = llm_stream(messages, model=FREEDEEPSEEK_MODEL)
-                text = clean_answer(out2["content"])
-                if text:
-                    out = out2
-            except ContextExceeded:
-                return last_text or "(контекст переполнен)", "context"
+        if out.get("finish") == "length":
+            fmt_errors += 1
+            print(f"[{_ts()}] ответ обрезан по max_tokens ({fmt_errors}/3)", flush=True)
+            if fmt_errors >= 3:
+                return strip_calls(text), "format"
+            messages.append({"role": "user", "content": "Ответ обрезан по длине. Отвечай короче: один вызов инструмента, без пояснений и без reasoning."})
+            continue
 
         used = (out["usage"] or {}).get("prompt_tokens", 0)
         if used > 0.85 * N_CTX:
             return strip_calls(text) or last_text, "context"
         if not text:
             fmt_errors += 1
-            print(f"[{_ts()}] пустой ответ модели ({fmt_errors}/3) даже после ретрая", flush=True)
+            print(f"[{_ts()}] пустой ответ модели ({fmt_errors}/3)", flush=True)
             if fmt_errors >= 3:
                 return last_text, "format"
-            messages.append({"role": "user", "content": "Ответ пуст. Отвечай короче и сразу вызови инструмент (блок @@CALL ... @@END)."})
+            messages.append({"role": "user", "content": "Ответ пуст. Вызови инструмент (блок @@CALL ... @@END) или коротко заверши раунд текстом."})
             continue
         last_text = text
         messages.append({"role": "assistant", "content": text})
@@ -1252,7 +1272,9 @@ def publish_comment(res, patch):
 
 # ======================= Один issue =======================
 STOP_TEXT = {"context": "переполнился контекст модели", "format": "модель не смогла соблюсти формат вызовов",
-             "budget": "исчерпан бюджет шагов раунда", "turns": "исчерпан лимит ходов раунда", "text": "модель завершила раунд текстом"}
+             "budget": "исчерпан бюджет шагов раунда", "turns": "исчерпан лимит ходов раунда",
+             "text": "модель завершила раунд текстом",
+             "rate_limit": "DeepSeek Web вернул 429 (rate limit) после всех попыток"}
 
 def solve_issue(it, base):
     n, t0 = it["number"], time.time()
@@ -1276,6 +1298,9 @@ def solve_issue(it, base):
         text, why = run_round(system, msg, tools, budget)
         carry = (text or "").strip()[-2000:]
         trace.append({"round": round_num, "end_reason": why, "end_text": carry})
+        if why == "rate_limit" and round_num < MAX_ROUNDS:
+            print(f"[{_ts()}] rate limit: пауза 90 с перед раундом {round_num + 1}/{MAX_ROUNDS}", flush=True)
+            time.sleep(90)
         status = issue_status(sess, base)
         if status in ("solved", "no_action"):
             break
@@ -1483,4 +1508,3 @@ if __name__ == "__main__":
     init_model()
     results = run_agent()
     print("\nГотово. Результаты в", OUT_DIR)
-    
