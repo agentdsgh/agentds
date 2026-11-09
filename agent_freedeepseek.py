@@ -131,6 +131,37 @@ def _gh_headers():
         h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     return h
 
+def _gh_retry_after(resp, attempt):
+    """Пауза перед повтором GitHub-запроса: Retry-After (секунды, «Xm Ys» или HTTP-дата),
+    иначе — экспоненциальный бэкофф с джиттером (тот же, что у LLM-ретраев)."""
+    if resp is not None:
+        ra = resp.headers.get("Retry-After")
+        if ra:
+            try:
+                return max(1.0, float(ra))
+            except ValueError:
+                pass
+            m = re.match(r"(?:(\d+)\s*m)?\s*(\d+)\s*s?", ra.strip())
+            if m and (m.group(1) or m.group(2)):
+                return max(1.0, int(m.group(1) or 0) * 60 + int(m.group(2) or 0))
+            try:
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(ra)
+                if dt is not None:
+                    return max(1.0, dt.timestamp() - time.time())
+            except (TypeError, ValueError):
+                pass
+        # X-RateLimit-Reset приходит как unix-timestamp — уважаем и его
+        reset = resp.headers.get("X-RateLimit-Reset")
+        if reset:
+            try:
+                wait = float(reset) - time.time()
+                if wait > 0:
+                    return max(1.0, wait)
+            except ValueError:
+                pass
+    return min(60.0, (2 ** attempt) + random.uniform(0, 1.0))
+
 def _gh_request(method, path, retries=3, **kwargs):
     last = None
     for attempt in range(retries):
@@ -139,7 +170,7 @@ def _gh_request(method, path, retries=3, **kwargs):
             return last
         if last.status_code == 403 and "rate limit" not in last.text.lower():
             return last
-        time.sleep(2 ** attempt)
+        time.sleep(_gh_retry_after(last, attempt))
     return last
 
 def gh_paginate(path, params=None, max_pages=10):
