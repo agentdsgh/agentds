@@ -1,6 +1,6 @@
 # github-tasks — навык OpenCode для работы с задачами GitHub
 
-Навык переносит полезную часть автономного агента из [`agent_freedeepseek.py`](../../agent_freedeepseek.py)
+Навык переносит полезную часть автономного агента из [`agent_freedeepseek.py`](../../../archive/agent_freedeepseek.py)
 в формат OpenCode skill: `SKILL.md` с инструкцией и детерминированный CLI
 `scripts/gh_tasks.py`. Встроенного LLM-цикла здесь нет — роль модели выполняет сам
 агент OpenCode, а скрипт делает только операции с GitHub API и git.
@@ -26,7 +26,7 @@ GitHub**, а не ключ модели. Console навыки не исполн�
 ## 2. Анатомия и установка
 
 ```text
-skills/github-tasks/
+.opencode/skills/github-tasks/
 ├── SKILL.md            # frontmatter + когда применять + процесс + правила
 ├── scripts/
 │   └── gh_tasks.py     # stdlib-only CLI, JSON на stdout
@@ -37,18 +37,15 @@ OpenCode ищет навыки в `~/.config/opencode/skills` и `.opencode/skil
 (плюс совместимые `~/.claude/skills`, `~/.agents/skills`). Каталог с `SKILL.md` —
 один навык; ID берётся из имени каталога, а не из поля `name`.
 
-Глобальная установка (рекомендуется — навык не привязан к репозиторию):
+В этом репозитории навык уже лежит в проектной папке `.opencode/skills/github-tasks`,
+поэтому достаточно запустить `opencode` в корне клона — навык подхватится сам.
+
+Глобальная установка (навык будет доступен во всех проектах):
 
 ```bash
 mkdir -p ~/.config/opencode/skills
-cp -r skills/github-tasks ~/.config/opencode/skills/
-```
-
-Проектная установка:
-
-```bash
-mkdir -p .opencode/skills
-cp -r skills/github-tasks .opencode/skills/
+ln -s "$PWD/.opencode/skills/github-tasks" ~/.config/opencode/skills/github-tasks
+# или копией: cp -r .opencode/skills/github-tasks ~/.config/opencode/skills/
 ```
 
 Проверка: запустить `opencode` и упомянуть `@github-tasks` либо попросить
@@ -169,7 +166,7 @@ opencode service start
 ## 8. Проверка
 
 ```bash
-python3 -m py_compile skills/github-tasks/scripts/gh_tasks.py
+python3 -m py_compile .opencode/skills/github-tasks/scripts/gh_tasks.py
 python3 $S --help
 python3 $S auth list                       # работает без сети
 python3 $S --repo owner/name doctor
@@ -211,4 +208,4 @@ python3 $S --repo owner/name report 42 --body-file /tmp/report.md
 - Модели и бесплатные модели: <https://opencode.ai/docs/models/>
 - Console (платные модели): <https://opencode.ai/docs/console/models/>
 - Go (подписка): <https://opencode.ai/docs/console/go/>
-- Исходный агент: [`agent_freedeepseek.py`](../../agent_freedeepseek.py)
+- Исходный агент: [`agent_freedeepseek.py`](../../../archive/agent_freedeepseek.py)

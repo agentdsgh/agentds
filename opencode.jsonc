@@ -1,0 +1,6 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Модель закреплять не обязательно: подойдёт выбранная в /models (в т.ч. бесплатная).
+  // "model": "opencode/deepseek-v4.1-flash-free",
+  "default_agent": "github-maintainer"
+}
