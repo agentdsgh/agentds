@@ -1,97 +1,92 @@
-# agentds
+# agentds — агент для GitHub-задач на OpenCode
 
-Нейросетевой агент, который автоматически решает issue в GitHub-репозиториях: читает задачу, изучает код, вносит правки, проверяет их и отправляет результат в новую ветку с pull request'ом и отчётом в исходном issue.
+Репозиторий содержит агента, который решает задачи GitHub: читает issue, изучает код,
+вносит правки, проверяет их и открывает pull request с отчётом в исходной задаче.
 
-Вся логика агента реализована в одном файле — [`agent_freedeepseek.py`](agent_freedeepseek.py). В качестве LLM используется **DeepSeek** через OpenAI-совместимый локальный прокси `FreeDeepseekAPI` (`http://localhost:9655/v1`).
+Работает поверх [OpenCode](https://opencode.ai): модель, tool-calls, сессии, права и
+субагенты — от OpenCode. Здесь лежат только агент, навык и документация.
 
-### Выбор LLM-провайдера (OpenRouter, Groq, …)
+## Чем отличается от v1
 
-Код общается с любым **OpenAI-совместимым** API (`/chat/completions`), поэтому провайдер
-переключается переменными окружения — без правки кода:
+Раньше вся логика была в одном файле `agent_freedeepseek.py`: свой LLM-клиент, свой цикл
+раундов, свой throttle, свой текстовый протокол вызова инструментов и отдельная
+модель-судья. Теперь это не нужно:
 
-| `LLM_PROVIDER` | `base_url` | ключ (env) | модель агента по умолчанию |
-|---|---|---|---|
-| `freedeepseek` (по умолчанию) | `http://localhost:9655/v1` | `FREEDEEPSEEK_API_KEY` | `deepseek-chat` |
-| `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | `deepseek/deepseek-chat-v3-0324:free` |
-| `groq` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | `llama-3.3-70b-versatile` |
+| v1 (`archive/agent_freedeepseek.py`) | Сейчас |
+|---|---|
+| свой вызов LLM и стрим | модель OpenCode (бесплатная, Console, Go или локальная) |
+| раунды, `StepBudget`, парсинг вызовов | нативные tool-calls и лимит `steps` у агента |
+| throttle и circuit breaker под 429 | ретраи на стороне провайдера и скрипта |
+| judge-модель | самопроверка агентом + тесты/линтер |
+| `read_file`/`write_file`/`run_command` | встроенные `read`, `edit`, `write`, `grep`, `shell` |
+| GitHub API + ветки + PR | навык `.opencode/skills/github-tasks` |
 
-Тонкие переопределения (работают для любого провайдера):
-`LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_JUDGE_MODEL`, `LLM_N_CTX`, `LLM_MIN_INTERVAL`.
-
-Примеры:
-
-```bash
-# OpenRouter (бесплатные модели помечены суффиксом :free)
-LLM_PROVIDER=openrouter OPENROUTER_API_KEY=sk-or-... python3 agent_freedeepseek.py
-
-# Groq
-LLM_PROVIDER=groq GROQ_API_KEY=gsk_... python3 agent_freedeepseek.py
-
-# Любой другой OpenAI-совместимый endpoint
-LLM_BASE_URL=https://my.host/v1 LLM_API_KEY=... LLM_MODEL=my-model python3 agent_freedeepseek.py
-```
-
-Для OpenRouter автоматически добавляются рекомендованные заголовки `HTTP-Referer` и `X-Title`.
-Healthcheck `/models` для сторонних провайдеров мягкий: если модели нет в списке, выводится
-предупреждение, а не падение (у OpenRouter/Groq списки большие и требуют ключ).
-
-### Бесплатные модели OpenRouter для этой задачи
-
-Агент делает длинные многошаговые вызовы с инструментами (правки файлов, git, отчёты),
-поэтому важны: большое контекстное окно, надёжный tool/JSON-фоллоуинг и стабильность.
-
-| Модель (`:free`) | Контекст | Комментарий для агента |
-|---|---|---|
-| `deepseek/deepseek-chat-v3-0324:free` | ~64k | **Рекомендуется по умолчанию**: сильный код, хороший фоллоуинг, дешёвый по токенам. |
-| `deepseek/deepseek-r1:free` | ~64k | Годится как судья/ревьюер (reasoning), для основного цикла медленнее. |
-| `qwen/qwen-2.5-coder-32b-instruct:free` | ~32k | Хорош для правок кода, но короче контекст. |
-| `meta-llama/llama-3.3-70b-instruct:free` | ~64k | Универсальный, стабильный, чуть слабее в коде. |
-| `google/gemini-2.0-flash-exp:free` | ~1M | Огромный контекст, но лимиты запросов ниже. |
-
-Практика: начните с `deepseek/deepseek-chat-v3-0324:free` для агента и
-`deepseek/deepseek-r1:free` для судьи; при rate-limit 429 переключитесь на
-`llama-3.3-70b-instruct:free` или `qwen-2.5-coder-32b-instruct:free`.
-Бесплатные модели OpenRouter имеют суточные/минутные лимиты — троттлинг в коде
-(`LLM_MIN_INTERVAL`, по умолчанию 3 с для OpenRouter) помогает их не превышать.
-
-## Возможности
-
-- **Работа по текстовому протоколу** — модель вызывает инструменты блоками `@@CALL ... @@END`, без нативных function-calling'ов, что позволяет использовать обычный чат-эндпоинт DeepSeek.
-- **Инструменты агента**: `get_issue`, `list_files`, `read_file`, `search_code`, `write_file`, `patch_file`, `delete_file`, `run_command`, `git_diff`, `commit`, `comment_issue`, `create_issue`, `report_work`, `report_no_action_needed`, `run_in_codespace`.
-- **Бюджет шагов и раундов** — на каждый issue выделяется несколько раундов по N вызовов, с автоматическим переносом контекста между раундами.
-- **Проверка в GitHub Codespaces** — опциональный запуск команд в облачной среде для проверок, которым мало локальной песочницы (devcontainer, другая версия рантайма, базы данных).
-- **Git-слой**: безопасные пути (`_safe`), защита `.git`, коммиты, ветка `agent/issue-N`, push и PR через GitHub API.
-- **GitHub-слой**: rate-limit-aware ретраи (`_gh_retry_after`), upsert-комментарий с отчётом, создание issue с защитой от дубликатов, PR-draft.
-- **Судья-ревьюер** (`deepseek-reasoner`) — независимая оценка решения по diff'у и тексту issue.
-- **Троттлинг и ретраи LLM** — общий минимальный интервал между запросами, уважение `Retry-After`, обработка 429/5xx.
-
-## Как это работает (кратко)
-
-1. Агент клонирует репозиторий и получает список открытых issue, упорядоченный по меткам `priority:p0..p2`.
-2. Для каждого issue создаётся ветка `agent/issue-<N>` (или продолжается уже существующая).
-3. Модель в цикле вызывает инструменты: читает код, вносит правки (`patch_file` / `write_file`), проверяет (`run_command` / `run_in_codespace`).
-4. Когда задача решена, модель вызывает `report_work(final=True)` (или `report_no_action_needed`, если правка не нужна).
-5. Ветка пушится в GitHub, открывается pull request, а в issue публикуется отчёт (отдельно — судья-ревьюер).
+Старая реализация сохранена в [`archive/`](archive/) — она больше не используется, но
+полезна как история решений и источник идей.
 
 ## Быстрый старт
 
-Нужны: Python 3.8+, локально запущенный прокси `FreeDeepseekAPI` на `localhost:9655`, токен GitHub с правами `Contents: Read and write` и `Pull requests: Read and write` (опционально — `Codespaces: Read and write` и `Workflows: Read and write`).
+1. Установите [OpenCode](https://opencode.ai/docs/) и запустите `opencode` в корне клона.
+2. Модель: подойдёт бесплатная (без ключа) или `/connect` для Console/Go. Платный ключ
+   модели для работы агента **не обязателен**.
+3. Сохраните токен GitHub (Issues, Contents, Pull requests: Read and write):
 
-```bash
-pip install requests
-export GITHUB_TOKEN="ghp_..."
-python agent_freedeepseek.py
-```
+   ```bash
+   printf '%s' 'ghp_xxx' | python3 .opencode/skills/github-tasks/scripts/gh_tasks.py \
+       auth set --repo owner/name
+   ```
 
-Полная инструкция по запуску, переменным окружения, режимам работы и диагностике — в [`docs/USAGE.md`](docs/USAGE.md).
+4. Проверьте доступ и запустите задачу:
 
-## Документация
+   ```bash
+   python3 .opencode/skills/github-tasks/scripts/gh_tasks.py --repo owner/name doctor
+   ```
 
-- [`docs/USAGE.md`](docs/USAGE.md) — полная инструкция использования и запуска.
-- [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md) — предложения по доработке и исправлению проекта.
+   Дальше достаточно сказать агенту: «разбери issue #N в `owner/name`».
 
-## Ограничения
+## Состав репозитория
 
-- Проект рассчитан на конкретный репозиторий: `GITHUB_OWNER` и `GITHUB_REPO` заданы константами в начале файла.
-- Требуется локальный прокси к DeepSeek Web (`localhost:9655`) — публичный DeepSeek API напрямую не используется.
-- Проверки выполняются в песочнице агента: опасные команды (`git push`, `sudo`, `gh`, доступ к секретам и т.п.) заблокированы.
+| Путь | Назначение |
+|---|---|
+| `opencode.jsonc` | конфигурация проекта: агент по умолчанию, права |
+| `AGENTS.md` | постоянные правила проекта для агента |
+| `.opencode/agents/github-maintainer.md` | primary-агент: процесс issue → PR → отчёт |
+| `.opencode/skills/github-tasks/SKILL.md` | инструкция навыка |
+| `.opencode/skills/github-tasks/scripts/gh_tasks.py` | CLI: issues, ветки, коммиты, PR, отчёты |
+| `.opencode/skills/github-tasks/README.md` | документация навыка (дополнение к opencode.ai) |
+| `archive/` | прежняя реализация v1 и её документация |
+
+## Модели
+
+| Вариант | Ключ | Когда подходит |
+|---|---|---|
+| Бесплатные модели OpenCode | не нужен | попробовать, небольшие задачи |
+| OpenCode Console | `oc_sk_...`, оплата по факту | нужны любые модели и свои скрипты |
+| OpenCode Go | подписка | регулярная работа с фиксированным лимитом |
+| Локальные (Ollama, LM Studio, vLLM) | не нужен | приватность, работа без интернета |
+
+Модель выбирается через `/models`; в конфиге проекта её можно закрепить полем `model`.
+Навык от модели не зависит.
+
+## Безопасность
+
+- Токены GitHub — только в `~/.config/opencode/github-tokens.json` (права `600`) или env.
+  В репозиторий и в issue они не попадают.
+- `gh_tasks.py` поддерживает `--dry-run` для всех операций записи.
+- Агент не делает force-push, не удаляет ветки и не мержит PR — это решение человека.
+- Не просите вставлять токен в чат: используйте `auth set` в своём терминале.
+- Перед публикацией отчёта агент обязан отделять проверенное от непроверенного.
+
+## Дальнейшие шаги
+
+- Codespaces-исполнение для тяжёлых тестов.
+- Команды `/issue`, `/triage`, `/report` для типовых сценариев.
+- Дополнительные навыки: ревью PR, релизы, triage по меткам.
+- CI: проверка `py_compile`, линт и `--help` на каждый PR.
+
+## Ссылки
+
+- OpenCode: <https://opencode.ai/docs/>
+- Навыки: <https://opencode.ai/docs/skills/>
+- Агенты: <https://opencode.ai/docs/agents/>
+- История v1: [`archive/README-v1.md`](archive/README-v1.md)
