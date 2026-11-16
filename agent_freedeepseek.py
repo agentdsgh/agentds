@@ -29,6 +29,81 @@ MIN_INTERVAL_JUDGE_SEC = 10.0 # отдельный интервал для су�
 _last_request_ts    = 0.0
 _last_request_lock  = threading.Lock()
 
+# ============ Провайдеры с OpenAI-совместимым API (OpenRouter, Groq, ...) ============
+# Код обращается к /chat/completions, поэтому достаточно поменять base_url/ключ/модель.
+# Выбор провайдера: LLM_PROVIDER=freedeepseek|openrouter|groq|custom (по умолчанию freedeepseek).
+# Переопределения: LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, LLM_JUDGE_MODEL, LLM_N_CTX, LLM_MIN_INTERVAL.
+PROVIDERS = {
+    "freedeepseek": {
+        "base_url": "http://localhost:9655/v1",
+        "api_key_env": "FREEDEEPSEEK_API_KEY",
+        "model": "deepseek-chat",
+        "judge_model": "deepseek-reasoner",
+        "n_ctx": 64000,
+        "headers": {},
+        "min_interval": 8.0,
+    },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+        # бесплатные модели OpenRouter помечены суффиксом ":free"
+        "model": "deepseek/deepseek-chat-v3-0324:free",
+        "judge_model": "deepseek/deepseek-r1:free",
+        "n_ctx": 64000,
+        "headers": {
+            # необязательные заголовки атрибуции, рекомендованные OpenRouter
+            "HTTP-Referer": "https://github.com/agentdsgh/agentds",
+            "X-Title": "agentds",
+        },
+        "min_interval": 3.0,
+    },
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
+        "model": "llama-3.3-70b-versatile",
+        "judge_model": "llama-3.3-70b-versatile",
+        "n_ctx": 32000,
+        "headers": {},
+        "min_interval": 1.0,
+    },
+}
+
+def get_provider():
+    """Настройки активного OpenAI-совместимого провайдера (env переопределяет дефолты)."""
+    name = (os.environ.get("LLM_PROVIDER") or "freedeepseek").strip().lower()
+    cfg = dict(PROVIDERS.get(name) or PROVIDERS["freedeepseek"])
+    base_url = (os.environ.get("LLM_BASE_URL") or cfg["base_url"]).rstrip("/")
+    api_key = os.environ.get("LLM_API_KEY") or os.environ.get(cfg.get("api_key_env") or "") or None
+    headers = {"Content-Type": "application/json"}
+    headers.update(cfg.get("headers") or {})
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return {
+        "name": name,
+        "base_url": base_url,
+        "model": os.environ.get("LLM_MODEL") or cfg["model"],
+        "judge_model": os.environ.get("LLM_JUDGE_MODEL") or cfg["judge_model"],
+        "n_ctx": int(os.environ.get("LLM_N_CTX") or cfg["n_ctx"]),
+        "headers": headers,
+        "min_interval": float(os.environ.get("LLM_MIN_INTERVAL") or cfg["min_interval"]),
+        "api_key": api_key,
+    }
+
+def llm_model():
+    return get_provider()["model"]
+
+def llm_judge_model():
+    return get_provider()["judge_model"]
+
+# Глобальные константы ниже используются по всему файлу (отчёты, судья, healthcheck),
+# поэтому сразу подставляем в них настройки выбранного провайдера.
+_PROVIDER = get_provider()
+FREEDEEPSEEK_URL         = _PROVIDER["base_url"]
+FREEDEEPSEEK_API_KEY     = _PROVIDER["api_key"]
+FREEDEEPSEEK_MODEL       = _PROVIDER["model"]
+FREEDEEPSEEK_JUDGE_MODEL = _PROVIDER["judge_model"]
+FREEDEEPSEEK_N_CTX       = _PROVIDER["n_ctx"]
+
 def _throttle(min_interval=None, label=""):
     """Гарантирует паузу между запросами (единый счётчик для всех моделей) и ЛОГИРУЕТ её."""
     global _last_request_ts
@@ -327,10 +402,9 @@ def llm_stream(messages, max_tokens=None, model=None, show=True):
     """OpenAI-совместимый вызов FreeDeepseekAPI с троттлингом и ретраями.
     reasoning_content намеренно игнорируется: прокси его дублирует и не даёт управлять глубиной.
     usage в стриме не приходит — оцениваем prompt_tokens по длине messages."""
-    model = model or FREEDEEPSEEK_MODEL
-    headers = {"Content-Type": "application/json"}
-    if FREEDEEPSEEK_API_KEY:
-        headers["Authorization"] = f"Bearer {FREEDEEPSEEK_API_KEY}"
+    provider = get_provider()
+    model = model or provider["model"]
+    headers = dict(provider["headers"])
 
     payload = {
         "model": model,
@@ -341,7 +415,10 @@ def llm_stream(messages, max_tokens=None, model=None, show=True):
         "top_p": 0.95,
     }
 
-    min_interval = MIN_INTERVAL_JUDGE_SEC if model == FREEDEEPSEEK_JUDGE_MODEL else MIN_INTERVAL_SEC
+    if model == provider["judge_model"]:
+        min_interval = max(provider["min_interval"], MIN_INTERVAL_JUDGE_SEC)
+    else:
+        min_interval = provider["min_interval"]
     t_req_start = time.time()
     last_err = None
     max_retries = MAX_RETRIES_429 if False else max(MAX_RETRIES_429, MAX_RETRIES_5XX)
@@ -1507,17 +1584,22 @@ if RUN_SELFTEST:
 
 # ======================= ЗАПУСК =======================
 def init_model():
-    """Проверяет доступность прокси, обеих моделей (agent и judge) и делает ping каждой."""
-    headers = {}
-    if FREEDEEPSEEK_API_KEY:
-        headers["Authorization"] = f"Bearer {FREEDEEPSEEK_API_KEY}"
+    """Проверяет доступность провайдера, обеих моделей (agent и judge) и делает ping каждой."""
+    provider = get_provider()
+    headers = dict(provider["headers"])
 
-    r = requests.get(FREEDEEPSEEK_URL + "/models", headers=headers, timeout=15)
-    r.raise_for_status()
-    ids = [m.get("id") for m in r.json().get("data", [])]
-    for needed in (FREEDEEPSEEK_MODEL, FREEDEEPSEEK_JUDGE_MODEL):
-        if needed not in ids:
-            raise RuntimeError(f"Модель '{needed}' отсутствует в /v1/models. Доступны: {ids}")
+    # /models у OpenRouter/Groq отдаёт большой список (и может требовать ключ),
+    # поэтому проверку наличия моделей делаем мягкой: предупреждаем, но не падаем.
+    try:
+        r = requests.get(FREEDEEPSEEK_URL + "/models", headers=headers, timeout=15)
+        r.raise_for_status()
+        ids = [m.get("id") for m in r.json().get("data", [])]
+        for needed in (FREEDEEPSEEK_MODEL, FREEDEEPSEEK_JUDGE_MODEL):
+            if ids and needed not in ids:
+                print(f"  ⚠️  Модель '{needed}' не найдена в /v1/models провайдера "
+                      f"'{provider['name']}' — пробуем всё равно.")
+    except Exception as e:
+        print(f"  ⚠️  Не удалось получить список моделей ({provider['name']}): {e}")
 
     for label, model in (("agent", FREEDEEPSEEK_MODEL), ("judge", FREEDEEPSEEK_JUDGE_MODEL)):
         try:

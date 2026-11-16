@@ -4,6 +4,56 @@
 
 Вся логика агента реализована в одном файле — [`agent_freedeepseek.py`](agent_freedeepseek.py). В качестве LLM используется **DeepSeek** через OpenAI-совместимый локальный прокси `FreeDeepseekAPI` (`http://localhost:9655/v1`).
 
+### Выбор LLM-провайдера (OpenRouter, Groq, …)
+
+Код общается с любым **OpenAI-совместимым** API (`/chat/completions`), поэтому провайдер
+переключается переменными окружения — без правки кода:
+
+| `LLM_PROVIDER` | `base_url` | ключ (env) | модель агента по умолчанию |
+|---|---|---|---|
+| `freedeepseek` (по умолчанию) | `http://localhost:9655/v1` | `FREEDEEPSEEK_API_KEY` | `deepseek-chat` |
+| `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | `deepseek/deepseek-chat-v3-0324:free` |
+| `groq` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | `llama-3.3-70b-versatile` |
+
+Тонкие переопределения (работают для любого провайдера):
+`LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_JUDGE_MODEL`, `LLM_N_CTX`, `LLM_MIN_INTERVAL`.
+
+Примеры:
+
+```bash
+# OpenRouter (бесплатные модели помечены суффиксом :free)
+LLM_PROVIDER=openrouter OPENROUTER_API_KEY=sk-or-... python3 agent_freedeepseek.py
+
+# Groq
+LLM_PROVIDER=groq GROQ_API_KEY=gsk_... python3 agent_freedeepseek.py
+
+# Любой другой OpenAI-совместимый endpoint
+LLM_BASE_URL=https://my.host/v1 LLM_API_KEY=... LLM_MODEL=my-model python3 agent_freedeepseek.py
+```
+
+Для OpenRouter автоматически добавляются рекомендованные заголовки `HTTP-Referer` и `X-Title`.
+Healthcheck `/models` для сторонних провайдеров мягкий: если модели нет в списке, выводится
+предупреждение, а не падение (у OpenRouter/Groq списки большие и требуют ключ).
+
+### Бесплатные модели OpenRouter для этой задачи
+
+Агент делает длинные многошаговые вызовы с инструментами (правки файлов, git, отчёты),
+поэтому важны: большое контекстное окно, надёжный tool/JSON-фоллоуинг и стабильность.
+
+| Модель (`:free`) | Контекст | Комментарий для агента |
+|---|---|---|
+| `deepseek/deepseek-chat-v3-0324:free` | ~64k | **Рекомендуется по умолчанию**: сильный код, хороший фоллоуинг, дешёвый по токенам. |
+| `deepseek/deepseek-r1:free` | ~64k | Годится как судья/ревьюер (reasoning), для основного цикла медленнее. |
+| `qwen/qwen-2.5-coder-32b-instruct:free` | ~32k | Хорош для правок кода, но короче контекст. |
+| `meta-llama/llama-3.3-70b-instruct:free` | ~64k | Универсальный, стабильный, чуть слабее в коде. |
+| `google/gemini-2.0-flash-exp:free` | ~1M | Огромный контекст, но лимиты запросов ниже. |
+
+Практика: начните с `deepseek/deepseek-chat-v3-0324:free` для агента и
+`deepseek/deepseek-r1:free` для судьи; при rate-limit 429 переключитесь на
+`llama-3.3-70b-instruct:free` или `qwen-2.5-coder-32b-instruct:free`.
+Бесплатные модели OpenRouter имеют суточные/минутные лимиты — троттлинг в коде
+(`LLM_MIN_INTERVAL`, по умолчанию 3 с для OpenRouter) помогает их не превышать.
+
 ## Возможности
 
 - **Работа по текстовому протоколу** — модель вызывает инструменты блоками `@@CALL ... @@END`, без нативных function-calling'ов, что позволяет использовать обычный чат-эндпоинт DeepSeek.
